@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+*.sqlite
+*.sqlite-journal
+*.db
+*.md
+!README.md
+.DS_Store
+.qloo/

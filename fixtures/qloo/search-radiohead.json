@@ -1,0 +1,49 @@
+{
+  "source": "Qloo hackathon entity search API",
+  "capturedAt": "2026-10-22T20:38:35.180Z",
+  "request": {
+    "query": "Radiohead",
+    "types": "urn:entity:artist",
+    "take": 5,
+    "sort_by": "match"
+  },
+  "response": {
+    "results": [
+      {
+        "entity_id": "70CAE5BF-2F4C-445C-A3E5-4EDACFC3591C",
+        "name": "Radiohead",
+        "properties": {
+          "short_description": "Radiohead is an English rock band known for their innovative and experimental approach to music."
+        }
+      },
+      {
+        "entity_id": "99ECEFED-B982-40C2-A2ED-EB042E9545FA",
+        "name": "Radiohead Tribute",
+        "properties": {
+          "short_description": "A tribute band dedicated to performing the music of Radiohead."
+        }
+      },
+      {
+        "entity_id": "BF711411-5659-4CEF-BC46-ADEAACEB52EA",
+        "name": "Dub Tribute To Radiohead",
+        "properties": {
+          "short_description": "A group performing dub reggae covers of Radiohead songs."
+        }
+      },
+      {
+        "entity_id": "A754373E-0D89-4FD7-85B4-6F22F413D1D1",
+        "name": "The Bluegrass Tribute to Radiohead",
+        "properties": {
+          "short_description": "A bluegrass tribute band performing covers of Radiohead songs."
+        }
+      },
+      {
+        "entity_id": "93D30F68-DA61-4CB3-A672-1C7983C79086",
+        "name": "Thom Yorke and Johnny Greenwood (Radiohead)",
+        "properties": {
+          "short_description": "Thom Yorke and Johnny Greenwood are key members of Radiohead, known for innovative alternative and experimental rock music."
+        }
+      }
+    ]
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "name": "server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --env-file-if-exists=../.env --import tsx --watch src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node --env-file-if-exists=../.env dist/index.js"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "dependencies": {
+    "@fastify/cookie": "^11.0.2",
+    "@fastify/static": "^10.1.6",
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "@taste-bridge/shared": "0.1.0",
+    "better-sqlite3": "^12.6.0",
+    "fastify": "^5.6.0",
+    "nanoid": "^5.1.5",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.20.6"
+  }
+}

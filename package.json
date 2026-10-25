@@ -1,0 +1,42 @@
+{
+  "name": "taste-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "workspaces": [
+    "shared",
+    "server",
+    "web"
+  ],
+  "scripts": {
+    "dev": "npm run build --workspace=shared && concurrently -k -n api,web -c green,cyan \"npm:dev:server\" \"npm:dev:web\"",
+    "dev:server": "npm run build --workspace=shared && npm --workspace=server run dev",
+    "dev:web": "npm --workspace=web run dev",
+    "build": "npm run build --workspace=shared && npm run build --workspace=server && npm run build --workspace=web",
+    "typecheck": "npm run build --workspace=shared && tsc -p server/tsconfig.test.json && npm --workspace=web run typecheck",
+    "start": "npm --workspace=server run start",
+    "test": "npm run build --workspace=shared && tsc -p server/tsconfig.test.json && vitest run",
+    "qloo:smoke": "node scripts/smoke-qloo.mjs",
+    "demo:plan": "node scripts/demo-plan.mjs"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.0",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.19.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^5.2.0",
+    "concurrently": "^9.2.0",
+    "tailwindcss": "^4.1.0",
+    "typescript": "^5.9.0",
+    "vite": "^7.3.7",
+    "vitest": "^5.0.5"
+  },
+  "allowScripts": {
+    "better-sqlite3@12.11.1": true,
+    "esbuild@0.28.2": true
+  }
+}
