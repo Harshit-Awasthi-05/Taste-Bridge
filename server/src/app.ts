@@ -1,5 +1,6 @@
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import cookie from "@fastify/cookie";
+import helmet from "@fastify/helmet";
 import fastifyStatic from "@fastify/static";
 import type Database from "better-sqlite3";
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -198,6 +199,7 @@ export function createApp(db: Database.Database, qloo: Client | null, options: {
   const webRoot = options.webRoot ?? resolve(process.cwd(), "web", "dist");
   const apiRequestWindows = new Map<string, RateLimitWindow>();
   const searchRequestWindows = new Map<string, RateLimitWindow>();
+  app.register(helmet);
   app.register(cookie);
 
   app.addHook("onRequest", async (request, reply) => {
