@@ -6,7 +6,8 @@ dist/
 *.sqlite
 *.sqlite-journal
 *.db
+data/*.db*
 *.md
-!README.md
+!/README.md
 .DS_Store
 .qloo/

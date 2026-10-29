@@ -1,4 +1,4 @@
-export type Category = 'dining' | 'music' | 'film_tv';
+export type Category = 'dining' | 'music' | 'film_tv' | 'tv_show' | 'books' | 'podcasts';
 export type RoomStatus = 'gathering' | 'generating' | 'ready' | 'failed';
 export type PlanStatus = 'generating' | 'ready' | 'failed';
 

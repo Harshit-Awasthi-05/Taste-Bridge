@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS favorites (
   qloo_id TEXT NOT NULL,
   name TEXT NOT NULL,
   entity_type TEXT NOT NULL,
+  source TEXT NOT NULL DEFAULT 'manual' CHECK (source IN ('manual', 'chat', 'demo')),
   PRIMARY KEY (member_id, qloo_id)
 );
 
@@ -55,6 +56,7 @@ CREATE TABLE IF NOT EXISTS member_search_results (
   entity_type TEXT NOT NULL,
   subtitle TEXT,
   image_url TEXT,
+  source TEXT NOT NULL DEFAULT 'manual' CHECK (source IN ('manual', 'chat', 'demo')),
   searched_at INTEGER NOT NULL,
   PRIMARY KEY (member_id, qloo_id)
 );
@@ -72,7 +74,7 @@ CREATE TABLE IF NOT EXISTS plans (
 CREATE TABLE IF NOT EXISTS picks (
   id TEXT PRIMARY KEY,
   room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
-  category TEXT NOT NULL CHECK (category IN ('dining', 'music', 'film_tv')),
+  category TEXT NOT NULL CHECK (category IN ('dining', 'music', 'film_tv', 'tv_show', 'books', 'podcasts')),
   rank INTEGER NOT NULL,
   state TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('active', 'replaced')),
   created_version INTEGER NOT NULL,
@@ -90,6 +92,16 @@ CREATE TABLE IF NOT EXISTS picks (
   UNIQUE (room_id, category, qloo_id)
 );
 CREATE INDEX IF NOT EXISTS idx_picks_room ON picks(room_id, state);
+
+CREATE TABLE IF NOT EXISTS plan_activity (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+  event_type TEXT NOT NULL,
+  summary TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_plan_activity_room_id
+  ON plan_activity(room_id, id);
 
 CREATE TABLE IF NOT EXISTS rejected_entities (
   room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,

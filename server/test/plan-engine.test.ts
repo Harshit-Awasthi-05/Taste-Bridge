@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Candidate, MemberRow } from "../src/plan-engine.js";
-import { calculateOverlap, explainCandidates } from "../src/plan-engine.js";
+import { calculateOverlap, combineRecommendationAffinities, explainCandidates } from "../src/plan-engine.js";
 
 const members: MemberRow[] = [
   { id: "member-a", favorites: [{ qloo_id: "favorite:a", name: "Radiohead", entity_type: "artist" }] },
@@ -43,6 +43,20 @@ describe("group overlap score", () => {
 
   it("returns zero when there are no member affinities", () => {
     expect(calculateOverlap([])).toBe(0);
+  });
+
+  it("weights chat-derived Qloo signals above other confirmed favorites", () => {
+    const chatSupported = combineRecommendationAffinities(0.4, 0, true, true);
+    const favoriteOnly = combineRecommendationAffinities(0, 0.8, true, true);
+
+    expect(chatSupported).toBeGreaterThan(favoriteOnly);
+    expect(chatSupported).toBeCloseTo(0.28);
+    expect(favoriteOnly).toBeCloseTo(0.24);
+  });
+
+  it("uses the available signal group at full weight when a member has no other group", () => {
+    expect(combineRecommendationAffinities(0.6, 0, true, false)).toBe(0.6);
+    expect(combineRecommendationAffinities(0, 0.6, false, true)).toBe(0.6);
   });
 });
 

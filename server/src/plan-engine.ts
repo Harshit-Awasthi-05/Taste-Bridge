@@ -2,9 +2,12 @@ import type Database from "better-sqlite3";
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import type { Category } from "@taste-bridge/shared";
 import { callQloo, entityTypes } from "./qloo.js";
+import { recordPlanActivity } from "./activity.js";
 
-export type MemberRow = { id: string; favorites: { qloo_id: string; name: string; entity_type: string }[] };
+export type MemberRow = { id: string; nickname?: string; favorites: { qloo_id: string; name: string; entity_type: string; source?: "manual" | "chat" | "demo" }[] };
 export type Candidate = { id: string; name: string; entityType: string; category: Category; memberAffinity: Record<string, number>; tags: { id: string; name: string }[]; overlapScore: number; source: { workflows: string[]; fetchedAt: string } };
+type RankedEntity = { id: string; name: string; entityType: string; rank: number };
+type MemberRecommendations = { chat: RankedEntity[]; favorites: RankedEntity[] };
 const now = () => Date.now();
 
 function entityFrom(value: unknown, category: Category) {
@@ -18,15 +21,20 @@ function entityFrom(value: unknown, category: Category) {
 }
 
 function getMembers(db: Database.Database, roomId: string): MemberRow[] {
-  return (db.prepare("SELECT id FROM members WHERE room_id = ? ORDER BY joined_at").all(roomId) as { id: string }[])
-    .map(({ id }) => ({
+  return (db.prepare("SELECT id, nickname FROM members WHERE room_id = ? ORDER BY joined_at").all(roomId) as { id: string; nickname: string }[])
+    .map(({ id, nickname }) => ({
       id,
-      favorites: db.prepare("SELECT qloo_id, name, entity_type FROM favorites WHERE member_id = ?").all(id) as MemberRow["favorites"],
+      nickname,
+      favorites: db.prepare("SELECT qloo_id, name, entity_type, source FROM favorites WHERE member_id = ?").all(id) as MemberRow["favorites"],
     }));
 }
 
-async function recommendForMember(client: Client, db: Database.Database, roomId: string, member: MemberRow, category: Category, city: string | null) {
-  const favorites = member.favorites.slice(0, 10);
+function favoritesForCategory(member: MemberRow, category: Category) {
+  const targetType = entityTypes[category];
+  return member.favorites.filter((favorite) => favorite.entity_type === "tag" || favorite.entity_type === targetType);
+}
+
+async function recommendForMember(client: Client, db: Database.Database, roomId: string, member: MemberRow, favorites: MemberRow["favorites"], category: Category, city: string | null, signalSource: "chat" | "favorites") {
   const entitySignals = favorites.filter((favorite) => favorite.entity_type !== "tag").map((favorite) => favorite.qloo_id);
   const tagSignals = favorites.filter((favorite) => favorite.entity_type === "tag").map((favorite) => favorite.qloo_id);
   if (!entitySignals.length && !tagSignals.length) return [];
@@ -44,11 +52,16 @@ async function recommendForMember(client: Client, db: Database.Database, roomId:
   const key = JSON.stringify({ tool: "qloo_recommend", args });
   const cached = db.prepare("SELECT value FROM qloo_cache WHERE key = ? AND expires_at > ?").get(key, now()) as { value: string } | undefined;
   let results: unknown[];
-  if (cached) results = JSON.parse(cached.value) as unknown[];
+  if (cached) {
+    results = JSON.parse(cached.value) as unknown[];
+    recordPlanActivity(db, roomId, "recommendation_cache", `Reused cached Qloo ${category} recommendations for ${member.nickname ?? "a member"} from ${signalSource} signals: entities [${entitySignals.map((id) => favorites.find((favorite) => favorite.qloo_id === id)?.name ?? id).join(", ")}], tags [${tagSignals.map((id) => favorites.find((favorite) => favorite.qloo_id === id)?.name ?? id).join(", ")}] (${results.length} results).`);
+  }
   else {
+    recordPlanActivity(db, roomId, "recommendation_request", `Called Qloo recommendations for ${member.nickname ?? "a member"}: ${category}, ${signalSource} signals, entity favorites [${entitySignals.map((id) => favorites.find((favorite) => favorite.qloo_id === id)?.name ?? id).join(", ")}], taste tags [${tagSignals.map((id) => favorites.find((favorite) => favorite.qloo_id === id)?.name ?? id).join(", ")}]${args.filter_location ? ` near ${String(args.filter_location)}` : ""}.`);
     const envelope = await callQloo(client, "qloo_recommend", args);
     results = envelope.results ?? [];
     db.prepare("INSERT OR REPLACE INTO qloo_cache(key, value, expires_at) VALUES (?, ?, ?)").run(key, JSON.stringify(results), now() + 10 * 60_000);
+    recordPlanActivity(db, roomId, "recommendation_result", `Qloo returned ${results.length} ${category} recommendations from ${signalSource} signals for ${member.nickname ?? "a member"}.`);
   }
   return results.flatMap((result, index) => {
     const entity = entityFrom(result, category);
@@ -57,13 +70,35 @@ async function recommendForMember(client: Client, db: Database.Database, roomId:
   });
 }
 
-async function recommendForGroup(client: Client, db: Database.Database, roomId: string, members: MemberRow[], category: Category, city: string | null) {
-  const results: Awaited<ReturnType<typeof recommendForMember>>[] = [];
+async function recommendForGroup(client: Client, db: Database.Database, roomId: string, members: MemberRow[], category: Category, city: string | null): Promise<MemberRecommendations[]> {
+  const results: MemberRecommendations[] = [];
   for (let index = 0; index < members.length; index += 3) {
     const batch = members.slice(index, index + 3);
-    results.push(...await Promise.all(batch.map((member) => recommendForMember(client, db, roomId, member, category, city))));
+    results.push(...await Promise.all(batch.map(async (member) => {
+      const categoryFavorites = favoritesForCategory(member, category);
+      const chatFavorites = categoryFavorites.filter((favorite) => favorite.source === "chat");
+      const otherFavorites = categoryFavorites.filter((favorite) => favorite.source !== "chat");
+      const [chat, favorites] = await Promise.all([
+        chatFavorites.length ? recommendForMember(client, db, roomId, member, chatFavorites.slice(0, 10), category, city, "chat") : [],
+        otherFavorites.length ? recommendForMember(client, db, roomId, member, otherFavorites.slice(0, 10), category, city, "favorites") : [],
+      ]);
+      return { chat, favorites };
+    })));
   }
   return results;
+}
+
+function rankAffinities(recommendations: RankedEntity[]) {
+  const maxRank = Math.max(1, ...recommendations.map((result) => result.rank - 1));
+  return new Map(recommendations.map((result) => [
+    result.id,
+    recommendations.length === 1 ? 1 : 1 - ((result.rank - 1) / maxRank),
+  ]));
+}
+
+export function combineRecommendationAffinities(chatAffinity: number, favoriteAffinity: number, hasChatSignals: boolean, hasOtherFavorites: boolean) {
+  if (hasChatSignals && hasOtherFavorites) return 0.7 * chatAffinity + 0.3 * favoriteAffinity;
+  return hasChatSignals ? chatAffinity : favoriteAffinity;
 }
 
 export function calculateOverlap(affinities: number[]) {
@@ -188,23 +223,48 @@ export async function generateRoomPlan(db: Database.Database, client: Client, ro
   const categories = JSON.parse(room.categories) as Category[];
   const rejected = new Set((db.prepare("SELECT category, qloo_id FROM rejected_entities WHERE room_id = ?").all(roomId) as { category: Category; qloo_id: string }[]).map((item) => `${item.category}:${item.qloo_id}`));
   const candidates: Candidate[] = [];
+  recordPlanActivity(db, roomId, "plan_started", `Started plan generation for ${categories.join(", ")} using ${members.length} confirmed member profiles.`);
 
   for (const category of categories) {
-    const relevantMembers = members.filter((member) => member.favorites.length > 0);
-    if (!relevantMembers.length) throw new Error(`No confirmed ${category} favorites`);
+    const relevantMembers = members.filter((member) => favoritesForCategory(member, category).length > 0);
+    if (!relevantMembers.length) {
+      recordPlanActivity(db, roomId, "category_skipped", `Skipped ${category}: no confirmed favorites or Qloo taste tags match this category.`);
+      continue;
+    }
     const perMember = await recommendForGroup(client, db, roomId, relevantMembers, category, room.city_or_area);
     const byId = new Map<string, Candidate>();
+    let rejectedCount = 0;
+    let favoriteCount = 0;
     for (const [index, member] of relevantMembers.entries()) {
-      const recommendations = perMember[index] ?? [];
-      const maxRank = Math.max(1, ...recommendations.map((result) => result.rank - 1));
-      for (const result of recommendations) {
-        if (rejected.has(`${category}:${result.id}`) || member.favorites.some((favorite) => favorite.qloo_id === result.id)) continue;
+      const memberRecommendations = perMember[index] ?? { chat: [], favorites: [] };
+      const chatAffinity = rankAffinities(memberRecommendations.chat);
+      const favoriteAffinity = rankAffinities(memberRecommendations.favorites);
+      const hasChatSignals = memberRecommendations.chat.length > 0;
+      const hasOtherFavorites = memberRecommendations.favorites.length > 0;
+      const merged = new Map<string, RankedEntity>();
+      for (const result of [...memberRecommendations.chat, ...memberRecommendations.favorites]) {
+        if (!merged.has(result.id)) merged.set(result.id, result);
+      }
+      for (const result of merged.values()) {
+        if (rejected.has(`${category}:${result.id}`)) {
+          rejectedCount += 1;
+          continue;
+        }
+        if (member.favorites.some((favorite) => favorite.qloo_id === result.id)) {
+          favoriteCount += 1;
+          continue;
+        }
         let candidate = byId.get(result.id);
         if (!candidate) {
           candidate = { id: result.id, name: result.name, entityType: result.entityType, category, memberAffinity: {}, tags: [], overlapScore: 0, source: { workflows: ["qloo_recommend"], fetchedAt: new Date(now()).toISOString() } };
           byId.set(result.id, candidate);
         }
-        const affinity = recommendations.length === 1 ? 1 : 1 - ((result.rank - 1) / maxRank);
+        const affinity = combineRecommendationAffinities(
+          chatAffinity.get(result.id) ?? 0,
+          favoriteAffinity.get(result.id) ?? 0,
+          hasChatSignals,
+          hasOtherFavorites,
+        );
         candidate.memberAffinity[member.id] = Math.max(candidate.memberAffinity[member.id] ?? 0, affinity);
       }
     }
@@ -214,9 +274,18 @@ export async function generateRoomPlan(db: Database.Database, client: Client, ro
       candidates.push(candidate);
     }
     if (!byId.size) throw new Error(`Qloo returned no eligible ${category} picks`);
+    const chatSignalMembers = relevantMembers.filter((member) =>
+      favoritesForCategory(member, category).some((favorite) => favorite.source === "chat")).length;
+    recordPlanActivity(db, roomId, "candidates_filtered", `Prioritized confirmed chat-derived favorites (70% when combined with other favorites) for ${chatSignalMembers}/${relevantMembers.length} members; filtered ${rejectedCount} previously rejected and ${favoriteCount} already-favorited ${category} results, leaving ${byId.size} eligible candidates.`);
   }
 
+  if (!candidates.length) throw new Error("No selected planning category has matching confirmed favorites");
+
   const explained = await explainCandidates(candidates, members);
+  const fallbackCount = explained.filter((item) => item.fallback).length;
+  recordPlanActivity(db, roomId, "explanations_ready", fallbackCount
+    ? `${fallbackCount} picks use grounded fallback explanations; ${explained.length - fallbackCount} received validated Gemini reasons.`
+    : `Gemini returned validated reasons for all ${explained.length} picks.`);
   const timestamp = now();
   const oldVersion = db.prepare("SELECT version FROM plans WHERE room_id = ?").get(roomId) as { version: number } | undefined;
   const version = (oldVersion?.version ?? 0) + 1;
@@ -228,6 +297,8 @@ export async function generateRoomPlan(db: Database.Database, client: Client, ro
       const selected = explained.filter((entry) => entry.candidate.category === category).sort((a, b) => b.candidate.overlapScore - a.candidate.overlapScore).slice(0, 3);
       selected.forEach((entry, index) => {
         const { candidate } = entry;
+        const supportCount = members.filter((member) => (candidate.memberAffinity[member.id] ?? 0) > 0).length;
+        recordPlanActivity(db, roomId, "pick_selected", `Selected ${candidate.name} for ${category} at rank ${index + 1}: ${candidate.overlapScore}% group overlap (equal weighting of average and weakest-member affinity), surfaced by Qloo for ${supportCount}/${members.length} members.`);
         db.prepare(`INSERT OR IGNORE INTO picks
           (id, room_id, category, rank, state, created_version, qloo_id, name, entity_type, qloo_tags, member_affinity, overlap_score, qloo_source, agent_blurb, agent_reasons, agent_model, agent_fallback)
           VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)

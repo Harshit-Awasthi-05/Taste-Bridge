@@ -5,6 +5,9 @@ export const entityTypes = {
   dining: "place",
   music: "artist",
   film_tv: "movie",
+  tv_show: "tv_show",
+  books: "book",
+  podcasts: "podcast",
 } as const;
 
 type Envelope = { status?: string; results?: unknown[]; summary?: string; error?: { code?: string; recovery?: string } };

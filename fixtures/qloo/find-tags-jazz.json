@@ -1,0 +1,88 @@
+{
+  "query": "jazz",
+  "capturedAt": "2026-10-29T11:51:24.537Z",
+  "response": {
+    "schema_version": "1.0-preview.1",
+    "operation": "find_tags",
+    "status": "ok",
+    "interpretation": {
+      "query": "jazz",
+      "semantic": true
+    },
+    "results": [
+      {
+        "id": "urn:tag:genre:qloo:jazz",
+        "name": "Jazz",
+        "type": "urn:tag:genre:qloo",
+        "popularity": 0.9994619038784862
+      },
+      {
+        "id": "urn:tag:genre:music:jazz",
+        "name": " Jazz",
+        "type": "urn:tag:genre:music",
+        "popularity": 0.9996973749297632
+      },
+      {
+        "id": "urn:tag:music:qloo:jazz",
+        "name": "Jazz",
+        "type": "urn:tag:music:qloo",
+        "popularity": 0.9821226576403287
+      },
+      {
+        "id": "urn:tag:genre_category:qloo:jazz",
+        "name": "Jazz",
+        "type": "urn:tag:genre_category:qloo",
+        "popularity": 0.999511542872618
+      },
+      {
+        "id": "urn:tag:subgenre:qloo:jazz",
+        "name": "Jazz",
+        "type": "urn:tag:subgenre:qloo",
+        "popularity": 0.9991330455423634
+      }
+    ],
+    "result_count": 5,
+    "provenance": {
+      "source": "Qloo API",
+      "endpoint": "/v2/tags",
+      "documentation": "https://docs.qloo.com/reference/get-tags",
+      "requests": [
+        {
+          "method": "GET",
+          "path": "/v2/tags",
+          "query": {
+            "filter.query": "jazz",
+            "feature.semantic_search": true,
+            "take": 5
+          }
+        }
+      ],
+      "transport": "mcp"
+    },
+    "query_intent": {
+      "schema_version": "1.0-preview.1",
+      "source_contract_version": "1.0.0",
+      "operation": "find_tags",
+      "job": "find_tags",
+      "signals": {},
+      "filters": {},
+      "operators": {},
+      "output": {
+        "limit": 5
+      },
+      "assumptions": [
+        "semantic=true"
+      ],
+      "unresolved": [],
+      "target": {
+        "concept": "jazz"
+      }
+    },
+    "execution": {
+      "transport": "mcp",
+      "transport_name": "Qloo canonical MCP",
+      "correlation_id": "mcp-3",
+      "duration_ms": 1095
+    }
+  }
+}

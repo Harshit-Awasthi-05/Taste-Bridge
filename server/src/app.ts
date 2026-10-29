@@ -13,9 +13,10 @@ import type { Category } from "@taste-bridge/shared";
 import { authenticateMember, createMemberToken, issueMemberSession } from "./session.js";
 import { searchQloo, searchQlooTags, entityTypes } from "./qloo.js";
 import { generateRoomPlan } from "./plan-engine.js";
+import { recordPlanActivity } from "./activity.js";
 
 const roomIdSchema = /^[A-Za-z0-9_-]{8,32}$/;
-const categorySchema = z.enum(["dining", "music", "film_tv"]);
+const categorySchema = z.enum(["dining", "music", "film_tv", "tv_show", "books", "podcasts"]);
 const coarseCitySchema = z.string().trim().min(2).max(100).refine((value) =>
   !/^\d[\d .,+-]*$/.test(value) &&
   !/[-+]?\d{1,2}(?:\.\d+)?\s*,\s*[-+]?\d{1,3}(?:\.\d+)?/.test(value) &&
@@ -31,6 +32,20 @@ const apiRateLimitMax = 120;
 const searchRateLimitMax = 20;
 const generationCooldownMs = 30_000;
 type RateLimitWindow = { startedAt: number; count: number };
+const demoNicknames = ["Demo Maya", "Demo Jordan"] as const;
+const demoConversation = [
+  { nickname: "Demo Maya", text: "I’m up for a relaxed plan with everyone." },
+  { nickname: "Demo Jordan", text: "Sounds good. It’ll be fun to see what the group picks." },
+  { nickname: "Demo Maya", text: "Agreed—let’s see what everyone likes." },
+] as const;
+const demoSearchTerms: Record<Category, [string, string, string]> = {
+  dining: ["Japanese restaurant", "noodle restaurant", "Italian restaurant"],
+  music: ["Radiohead", "Khruangbin", "Björk"],
+  film_tv: ["Spirited Away", "Spider-Man: Into the Spider-Verse", "Everything Everywhere All at Once"],
+  tv_show: ["The Bear", "Severance", "Abbott Elementary"],
+  books: ["Project Hail Mary", "The Hobbit", "Pachinko"],
+  podcasts: ["Planet Money", "99% Invisible", "Radiolab"],
+};
 const configuredTtl = Number(process.env.ROOM_TTL_HOURS ?? 72);
 const roomTtlHours = Number.isInteger(configuredTtl) && configuredTtl >= 24 && configuredTtl <= 168 ? configuredTtl : 72;
 const roomCategories = (value: string) => JSON.parse(value) as Category[];
@@ -51,13 +66,13 @@ function apiError(reply: FastifyReply, status: number, code: string, message: st
   return reply.code(status).send({ error: { code, message } });
 }
 
-function consumeRateLimit(limits: Map<string, RateLimitWindow>, key: string, max: number, now = timestamp()) {
+function consumeRateLimit(limits: Map<string, RateLimitWindow>, key: string, max: number, cost = 1, now = timestamp()) {
   let window = limits.get(key);
   if (!window || now - window.startedAt >= apiRateLimitWindowMs) {
     window = { startedAt: now, count: 0 };
     limits.set(key, window);
   }
-  window.count += 1;
+  window.count += cost;
   if (limits.size > 10_000) {
     for (const [entryKey, entry] of limits) {
       if (now - entry.startedAt >= apiRateLimitWindowMs) limits.delete(entryKey);
@@ -67,6 +82,13 @@ function consumeRateLimit(limits: Map<string, RateLimitWindow>, key: string, max
     allowed: window.count <= max,
     retryAfter: Math.max(1, Math.ceil((window.startedAt + apiRateLimitWindowMs - now) / 1000)),
   };
+}
+
+function redactNicknames(text: string, nicknames: string[]) {
+  return nicknames.reduce((result, nickname) => {
+    const escaped = nickname.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return result.replace(new RegExp(escaped, "gi"), "");
+  }, text);
 }
 
 function requireMember(request: FastifyRequest, reply: FastifyReply, db: Database.Database, roomId: string) {
@@ -84,13 +106,15 @@ function roomState(db: Database.Database, roomId: string, request: FastifyReques
   const me = session ?? authenticateMember(request, db, roomId);
   const memberCount = db.prepare("SELECT COUNT(*) AS count FROM members WHERE room_id = ?").get(roomId) as { count: number };
   const readyCount = db.prepare("SELECT COUNT(*) AS count FROM members WHERE room_id = ? AND ready = 1").get(roomId) as { count: number };
-  const members = me ? (db.prepare("SELECT id, nickname, is_host, ready FROM members WHERE room_id = ? ORDER BY joined_at").all(roomId) as
-    { id: string; nickname: string; is_host: number; ready: number }[]).map((member) => {
-    const favorites = db.prepare("SELECT qloo_id AS qlooId, name, entity_type AS entityType FROM favorites WHERE member_id = ? ORDER BY rowid").all(member.id);
-    return { id: member.id, nickname: member.nickname, isHost: member.is_host === 1, ready: member.ready === 1, favorites };
+  const members = me ? (db.prepare(`SELECT members.id, members.nickname, members.is_host, members.ready,
+      EXISTS (SELECT 1 FROM chat_messages WHERE chat_messages.member_id = members.id) AS has_chatted
+      FROM members WHERE members.room_id = ? ORDER BY members.joined_at`).all(roomId) as
+    { id: string; nickname: string; is_host: number; ready: number; has_chatted: number }[]).map((member) => {
+    const favorites = db.prepare("SELECT qloo_id AS qlooId, name, entity_type AS entityType, source FROM favorites WHERE member_id = ? ORDER BY rowid").all(member.id);
+    return { id: member.id, nickname: member.nickname, isHost: member.is_host === 1, ready: member.ready === 1, hasChatted: member.has_chatted === 1, favorites };
   }) : [];
-  const plan = db.prepare("SELECT version, status, error_code FROM plans WHERE room_id = ?").get(roomId) as
-    | { version: number; status: string; error_code: string | null }
+  const plan = db.prepare("SELECT version, status, error_code, updated_at FROM plans WHERE room_id = ?").get(roomId) as
+    | { version: number; status: string; error_code: string | null; updated_at: number }
     | undefined;
   const picks = me && plan && plan.version > 0
     ? db.prepare(`SELECT id, category, rank, qloo_id AS entityId, name, entity_type AS type,
@@ -138,6 +162,10 @@ function roomState(db: Database.Database, roomId: string, request: FastifyReques
       WHERE chat_messages.room_id = ? ORDER BY chat_messages.created_at DESC LIMIT 100`).all(roomId) as
       { id: string; memberId: string; nickname: string; text: string; createdAt: number }[]).reverse()
     : [];
+  const planActivity = me
+    ? (db.prepare("SELECT id, event_type AS eventType, summary, created_at AS createdAt FROM plan_activity WHERE room_id = ? ORDER BY id DESC LIMIT 100").all(roomId) as
+      { id: number; eventType: string; summary: string; createdAt: number }[]).reverse()
+    : [];
   return {
     id: room.id,
     categories: roomCategories(room.categories),
@@ -151,7 +179,11 @@ function roomState(db: Database.Database, roomId: string, request: FastifyReques
     planVersion: plan?.version ?? 0,
     planStatus: plan?.status ?? "gathering",
     planError: plan?.error_code ?? null,
+    planCooldownSeconds: plan && plan.status !== "generating"
+      ? Math.max(0, Math.ceil((plan.updated_at + generationCooldownMs - timestamp()) / 1000))
+      : 0,
     picks,
+    planActivity,
     chatMessages,
     me: me ? {
       memberId: me.id,
@@ -159,6 +191,31 @@ function roomState(db: Database.Database, roomId: string, request: FastifyReques
       ready: members.find((member) => member.id === me.id)?.ready ?? false,
     } : null,
   };
+}
+
+function beginPlanGeneration(db: Database.Database, qloo: Client, request: FastifyRequest, roomId: string, version: number) {
+  if (version > 0) {
+    db.transaction(() => {
+      const active = db.prepare("SELECT category, qloo_id FROM picks WHERE room_id = ? AND state = 'active'").all(roomId) as { category: string; qloo_id: string }[];
+      const reject = db.prepare("INSERT OR IGNORE INTO rejected_entities(room_id, category, qloo_id, rejected_at) VALUES (?, ?, ?, ?)");
+      active.forEach((pick) => reject.run(roomId, pick.category, pick.qloo_id, timestamp()));
+      if (active.length) {
+        recordPlanActivity(db, roomId, "rejected_picks", `Excluded ${active.length} picks from the previous plan before regeneration.`);
+      }
+    })();
+  }
+  db.prepare("INSERT OR REPLACE INTO plans(room_id, version, status, error_code, updated_at) VALUES (?, ?, 'generating', NULL, ?)").run(roomId, version, timestamp());
+  db.prepare("UPDATE rooms SET status = 'generating' WHERE id = ?").run(roomId);
+  broadcast(roomId);
+  void generateRoomPlan(db, qloo, roomId).then(() => {
+    broadcast(roomId);
+  }).catch((error: unknown) => {
+    request.log.error({ err: error }, "Plan generation failed");
+    recordPlanActivity(db, roomId, "plan_failed", "Plan generation failed; check Qloo availability and try again after the cooldown.");
+    db.prepare("UPDATE plans SET status = 'failed', error_code = 'GENERATION_FAILED', updated_at = ? WHERE room_id = ?").run(timestamp(), roomId);
+    db.prepare("UPDATE rooms SET status = 'failed' WHERE id = ?").run(roomId);
+    broadcast(roomId);
+  });
 }
 
 function verifyOrigin(request: FastifyRequest, reply: FastifyReply) {
@@ -199,6 +256,7 @@ export function createApp(db: Database.Database, qloo: Client | null, options: {
   const webRoot = options.webRoot ?? resolve(process.cwd(), "web", "dist");
   const apiRequestWindows = new Map<string, RateLimitWindow>();
   const searchRequestWindows = new Map<string, RateLimitWindow>();
+  const demoSeedingRooms = new Set<string>();
   app.register(helmet);
   app.register(cookie);
 
@@ -250,7 +308,7 @@ export function createApp(db: Database.Database, qloo: Client | null, options: {
   app.post("/api/rooms", async (request, reply) => {
     const body = z.object({
       nickname: z.string().trim().min(1).max(24).regex(/^[^\u0000-\u001f\u007f]+$/),
-      categories: z.array(categorySchema).min(1).max(3).refine((items) => new Set(items).size === items.length),
+      categories: z.array(categorySchema).min(1).max(6).refine((items) => new Set(items).size === items.length),
       city: coarseCitySchema.nullable().optional(),
     }).safeParse(request.body);
     if (!body.success) return apiError(reply, 400, "INVALID_ROOM", "Add a nickname, at least one category, and a valid city when planning dining.");
@@ -355,12 +413,116 @@ export function createApp(db: Database.Database, qloo: Client | null, options: {
     return { room: roomState(db, roomId, request) };
   });
 
+  app.post("/api/rooms/:roomId/chat-suggestions", async (request, reply) => {
+    const { roomId } = request.params as { roomId: string };
+    const member = requireMember(request, reply, db, roomId);
+    if (!member) return;
+    const room = getRoom(db, roomId);
+    if (!room) return apiError(reply, 404, "ROOM_NOT_FOUND", "This room has expired or does not exist.");
+    if (!process.env.QLOO_API_KEY) return apiError(reply, 503, "QLOO_CREDENTIAL_REQUIRED", "Configure the server's Qloo API key to suggest live Qloo entities.");
+
+    const recentMessages = (db.prepare(`SELECT text FROM chat_messages
+      WHERE room_id = ? AND member_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 5`).all(roomId, member.id) as { text: string }[])
+      .reverse().map(({ text }) => text);
+    if (recentMessages.length < 3) {
+      return apiError(reply, 409, "CHAT_CONTEXT_REQUIRED", "Send at least three chat messages before asking for suggestions.");
+    }
+
+    const nicknames = (db.prepare("SELECT nickname FROM members WHERE room_id = ?").all(roomId) as { nickname: string }[])
+      .map(({ nickname }) => nickname);
+    const safeMessages = recentMessages.map((text) => redactNicknames(text, nicknames));
+    if (safeMessages.every((text) => !text.trim())) {
+      return apiError(reply, 422, "CHAT_CONTEXT_EMPTY", "Your recent messages do not contain any text to search.");
+    }
+    const fallbackKeywords = () => [...new Map(safeMessages.slice(-3)
+      .map((text) => text.trim().slice(0, 100))
+      .filter(Boolean)
+      .map((text) => [text.toLocaleLowerCase(), text])).values()];
+    let keywords = fallbackKeywords();
+    let keywordSource: "gemini" | "messages" = "messages";
+    const geminiKey = process.env.GEMINI_API_KEY;
+    if (geminiKey) {
+      try {
+        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=${encodeURIComponent(geminiKey)}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: JSON.stringify({
+              messages: safeMessages,
+              instruction: "Extract 1 to 3 concise public-interest keywords that could identify places, music artists, or movies. Return only JSON shaped as {\"keywords\":[\"...\"]}. Do not include personal names, nicknames, emails, phone numbers, or explanations.",
+            }) }] }],
+            generationConfig: { responseMimeType: "application/json", temperature: 0 },
+          }),
+          signal: AbortSignal.timeout(6_000),
+        });
+        if (!response.ok) throw new Error(`Gemini keyword extraction failed with HTTP ${response.status}`);
+        const payload = await response.json() as { candidates?: { content?: { parts?: { text?: string }[] } }[] };
+        const text = payload.candidates?.[0]?.content?.parts?.find((part) => typeof part.text === "string")?.text;
+        if (!text) throw new Error("Gemini returned no keyword content");
+        const parsed = z.object({
+          keywords: z.array(z.string().trim().min(2).max(100))
+            .min(1).max(3)
+            .refine((items) => items.every((item) =>
+              !/(?:[\w.+-]+@[\w.-]+\.[A-Za-z]{2,})|(?:\+?\d[\d\s().-]{7,}\d)/.test(item) &&
+              !nicknames.some((nickname) => item.toLocaleLowerCase().includes(nickname.toLocaleLowerCase())))),
+        }).safeParse(JSON.parse(text));
+        if (!parsed.success) throw new Error("Gemini returned invalid keywords");
+        keywords = [...new Map(parsed.data.keywords.map((item) => [item.toLocaleLowerCase(), item])).values()];
+        keywordSource = "gemini";
+      } catch {
+        request.log.warn("Gemini keyword extraction unavailable; searching recent messages directly");
+      }
+    }
+
+    const tasks = keywords.flatMap((keyword) => roomCategories(room.categories).map((category) => ({
+      keyword,
+      category,
+      entityType: entityTypes[category],
+    })));
+    const limit = consumeRateLimit(searchRequestWindows, member.id, searchRateLimitMax, tasks.length);
+    if (!limit.allowed) {
+      reply.header("Retry-After", String(limit.retryAfter));
+      return apiError(reply, 429, "SEARCH_RATE_LIMITED", "Too many searches. Please wait a minute before asking for suggestions.");
+    }
+
+    try {
+      const responses = await Promise.all(tasks.map(async (task) => ({
+        task,
+        results: await searchQloo(task.keyword, task.entityType),
+      })));
+      const uniqueResults = new Map<string, Awaited<ReturnType<typeof searchQloo>>[number]>();
+      const maxResults = Math.max(0, ...responses.map((response) => response.results.length));
+      for (let rank = 0; rank < maxResults && uniqueResults.size < 3; rank += 1) {
+        for (const response of responses) {
+          const result = response.results[rank];
+          if (result && !uniqueResults.has(result.id)) uniqueResults.set(result.id, result);
+          if (uniqueResults.size === 3) break;
+        }
+      }
+      const results = [...uniqueResults.values()];
+      const now = timestamp();
+      const saveSearch = db.prepare(`INSERT OR REPLACE INTO member_search_results
+        (member_id, qloo_id, name, entity_type, subtitle, image_url, source, searched_at) VALUES (?, ?, ?, ?, ?, ?, 'chat', ?)`);
+      db.transaction(() => results.forEach((result) =>
+        saveSearch.run(member.id, result.id, result.name, result.entityType, result.description, result.imageUrl, now)))();
+      return { results: results.map((item) => ({ ...item, subtitle: item.description })), keywords, keywordSource };
+    } catch (error) {
+      request.log.error({ err: error }, "Qloo chat suggestions failed");
+      return apiError(reply, 502, "QLOO_SUGGESTIONS_FAILED", "Could not load Qloo suggestions from chat right now.");
+    }
+  });
+
   app.get("/api/rooms/:roomId/search", async (request, reply) => {
     const { roomId } = request.params as { roomId: string };
     const member = requireMember(request, reply, db, roomId);
     if (!member) return;
-    const query = z.object({ q: z.string().trim().min(2).max(100), type: z.enum(["dining", "music", "film_tv", "tag"]) }).safeParse(request.query);
+    const query = z.object({ q: z.string().trim().min(2).max(100), type: z.enum(["dining", "music", "film_tv", "tv_show", "books", "podcasts", "tag"]) }).safeParse(request.query);
     if (!query.success) return apiError(reply, 400, "INVALID_SEARCH", "Enter at least two characters and choose a favorite type.");
+    const room = getRoom(db, roomId);
+    if (!room) return apiError(reply, 404, "ROOM_NOT_FOUND", "This room has expired or does not exist.");
+    if (query.data.type !== "tag" && !roomCategories(room.categories).includes(query.data.type)) {
+      return apiError(reply, 400, "CATEGORY_NOT_SELECTED", "Search only for categories selected for this room.");
+    }
     if (/(?:[\w.+-]+@[\w.-]+\.[A-Za-z]{2,})|(?:\+?\d[\d\s().-]{7,}\d)/.test(query.data.q)) return apiError(reply, 400, "PERSONAL_DATA_BLOCKED", "Search for a public entity, not an email address or phone number.");
     const limit = consumeRateLimit(searchRequestWindows, member.id, searchRateLimitMax);
     if (!limit.allowed) {
@@ -368,6 +530,8 @@ export function createApp(db: Database.Database, qloo: Client | null, options: {
       return apiError(reply, 429, "SEARCH_RATE_LIMITED", "Too many searches. Please wait a minute before searching again.");
     }
     try {
+      const searcher = db.prepare("SELECT nickname FROM members WHERE id = ?").get(member.id) as { nickname: string };
+      recordPlanActivity(db, roomId, "qloo_search_request", `Searching Qloo for ${query.data.type} favorites for ${searcher.nickname}: “${query.data.q}”.`);
       let results: Awaited<ReturnType<typeof searchQloo>>;
       if (query.data.type === "tag") {
         if (!qloo) return apiError(reply, 503, "QLOO_UNAVAILABLE", "Qloo tag search is unavailable right now.");
@@ -375,13 +539,21 @@ export function createApp(db: Database.Database, qloo: Client | null, options: {
       } else {
         results = await searchQloo(query.data.q, entityTypes[query.data.type]);
       }
-      const upsert = db.prepare(`INSERT OR REPLACE INTO member_search_results
-        (member_id, qloo_id, name, entity_type, subtitle, image_url, searched_at) VALUES (?, ?, ?, ?, ?, ?, ?)`);
+      recordPlanActivity(db, roomId, "qloo_search_result", `Qloo ${query.data.type} search for “${query.data.q}” returned ${results.length} results for ${searcher.nickname}.`);
+      const upsert = db.prepare(`INSERT INTO member_search_results
+        (member_id, qloo_id, name, entity_type, subtitle, image_url, source, searched_at) VALUES (?, ?, ?, ?, ?, ?, 'manual', ?)
+        ON CONFLICT(member_id, qloo_id) DO UPDATE SET
+          name = excluded.name, entity_type = excluded.entity_type, subtitle = excluded.subtitle,
+          image_url = excluded.image_url,
+          source = CASE WHEN member_search_results.source = 'chat' THEN 'chat' ELSE 'manual' END,
+          searched_at = excluded.searched_at`);
       const now = timestamp();
       db.transaction(() => results.forEach((result) => upsert.run(member.id, result.id, result.name, result.entityType, result.description, result.imageUrl, now)))();
+      broadcast(roomId);
       return { results: results.map((item) => ({ ...item, subtitle: item.description })) };
     } catch (error) {
       request.log.error({ err: error }, "Qloo search failed");
+      broadcast(roomId);
       return apiError(reply, 502, "QLOO_SEARCH_FAILED", "Qloo search is unavailable right now.");
     }
   });
@@ -395,18 +567,179 @@ export function createApp(db: Database.Database, qloo: Client | null, options: {
     const room = getRoom(db, roomId);
     if (!room || room.status !== "gathering") return apiError(reply, 409, "ROOM_CLOSED", "Favorites can no longer be changed.");
     const placeholders = body.data.qlooIds.map(() => "?").join(",");
-    const selected = db.prepare(`SELECT qloo_id, name, entity_type FROM member_search_results WHERE member_id = ? AND qloo_id IN (${placeholders})`)
-      .all(member.id, ...body.data.qlooIds) as { qloo_id: string; name: string; entity_type: string }[];
+    const selected = db.prepare(`SELECT qloo_id, name, entity_type, source FROM member_search_results WHERE member_id = ? AND qloo_id IN (${placeholders})`)
+      .all(member.id, ...body.data.qlooIds) as { qloo_id: string; name: string; entity_type: string; source: "manual" | "chat" | "demo" }[];
     if (selected.length !== body.data.qlooIds.length) return apiError(reply, 400, "SEARCH_RESULT_REQUIRED", "Favorites must be selected from your own recent Qloo search results.");
     const save = db.transaction(() => {
       db.prepare("DELETE FROM favorites WHERE member_id = ?").run(member.id);
-      const insert = db.prepare("INSERT INTO favorites(member_id, qloo_id, name, entity_type) VALUES (?, ?, ?, ?)");
-      selected.forEach((item) => insert.run(member.id, item.qloo_id, item.name, item.entity_type));
+      const insert = db.prepare("INSERT INTO favorites(member_id, qloo_id, name, entity_type, source) VALUES (?, ?, ?, ?, ?)");
+      selected.forEach((item) => insert.run(member.id, item.qloo_id, item.name, item.entity_type, item.source));
       db.prepare("UPDATE members SET ready = 1 WHERE id = ?").run(member.id);
     });
     save();
     broadcast(roomId);
     return { room: roomState(db, roomId, request) };
+  });
+
+  app.post("/api/rooms/:roomId/demo", async (request, reply) => {
+    const { roomId } = request.params as { roomId: string };
+    const member = requireMember(request, reply, db, roomId);
+    if (!member) return;
+    if (!member.isHost) return apiError(reply, 403, "HOST_REQUIRED", "Only the room creator can start the solo demo.");
+    const room = getRoom(db, roomId);
+    if (!room) return apiError(reply, 404, "ROOM_NOT_FOUND", "This room has expired or does not exist.");
+    if (room.status === "generating" || room.status === "ready") return apiError(reply, 409, "ROOM_CLOSED", "The solo demo can only start before a plan is ready.");
+    if (!qloo) return apiError(reply, 503, "QLOO_UNAVAILABLE", "The Qloo MCP connection is unavailable.");
+    if (!process.env.QLOO_API_KEY) return apiError(reply, 503, "QLOO_CREDENTIAL_REQUIRED", "Configure the server's Qloo API key to create live-Qloo demo favorites.");
+    if (demoSeedingRooms.has(roomId)) return apiError(reply, 409, "DEMO_IN_PROGRESS", "Demo friends are already being added.");
+    const previousPlan = db.prepare("SELECT version, status, updated_at FROM plans WHERE room_id = ?").get(roomId) as
+      { version: number; status: string; updated_at: number } | undefined;
+    if (previousPlan && previousPlan.status !== "generating") {
+      const remaining = generationCooldownMs - (timestamp() - previousPlan.updated_at);
+      if (remaining > 0) {
+        reply.header("Retry-After", String(Math.ceil(remaining / 1000)));
+        return apiError(reply, 429, "PLAN_COOLDOWN", "Please wait briefly before trying the solo demo again.");
+      }
+    }
+
+    const roster = db.prepare("SELECT COUNT(*) AS count FROM members WHERE room_id = ?").get(roomId) as { count: number };
+    const existingDemos = db.prepare("SELECT id, nickname FROM members WHERE room_id = ? AND nickname IN (?, ?) ORDER BY nickname")
+      .all(roomId, ...demoNicknames) as { id: string; nickname: string }[];
+    if (existingDemos.length === 0 && roster.count !== 1) {
+      return apiError(reply, 409, "DEMO_REQUIRES_SOLO_ROOM", "Start the demo before inviting other people.");
+    }
+    if (existingDemos.length !== 0 && existingDemos.length !== demoNicknames.length) {
+      return apiError(reply, 409, "DEMO_STATE_INVALID", "This room has an incomplete demo setup. Create a fresh room to retry.");
+    }
+    if (roster.count + (existingDemos.length ? 0 : demoNicknames.length) > 6) {
+      return apiError(reply, 409, "ROOM_FULL", "There is not enough room to add both demo friends.");
+    }
+
+    demoSeedingRooms.add(roomId);
+    const reservation = db.prepare("UPDATE rooms SET status = 'generating' WHERE id = ? AND status IN ('gathering', 'failed')").run(roomId);
+    if (reservation.changes !== 1) {
+      demoSeedingRooms.delete(roomId);
+      return apiError(reply, 409, "DEMO_IN_PROGRESS", "This room is already being updated.");
+    }
+    broadcast(roomId);
+    try {
+      const host = db.prepare("SELECT id, nickname FROM members WHERE id = ? AND room_id = ?").get(member.id, roomId) as { id: string; nickname: string };
+      const profiles = [
+        host,
+        ...demoNicknames.map((nickname) => ({
+          id: existingDemos.find((item) => item.nickname === nickname)?.id ?? randomUUID(),
+          nickname,
+        })),
+      ];
+      const demoProfiles = profiles.slice(1);
+      const seedResults: {
+        memberId: string;
+        memberName: string;
+        category: Category;
+        query: string;
+        result: Awaited<ReturnType<typeof searchQloo>>[number];
+      }[] = [];
+      const favoriteCounts = new Map(demoProfiles.map((profile) => [profile.id, 0]));
+      const categoryCounts = new Map(demoProfiles.map((profile) => [profile.id, new Map<Category, number>()]));
+      for (const profile of demoProfiles) {
+        const existing = db.prepare("SELECT entity_type FROM favorites WHERE member_id = ?").all(profile.id) as { entity_type: string }[];
+        favoriteCounts.set(profile.id, existing.length);
+        for (const category of roomCategories(room.categories)) {
+          categoryCounts.get(profile.id)?.set(category, existing.filter((item) => item.entity_type === entityTypes[category]).length);
+        }
+      }
+      const tasks: { profile: typeof demoProfiles[number]; category: Category; query: string }[] = [];
+      const categories = roomCategories(room.categories);
+      const addTask = (profile: typeof demoProfiles[number], category: Category) => {
+        const total = favoriteCounts.get(profile.id) ?? 0;
+        if (total >= 4) throw new Error(`Cannot add more demo favorites for ${profile.nickname}`);
+        const queryIndex = categoryCounts.get(profile.id)?.get(category) ?? 0;
+        const term = demoSearchTerms[category][queryIndex];
+        if (!term) throw new Error(`No unused ${category} search term for ${profile.nickname}`);
+        const query = category === "dining" && room.city_or_area
+          ? `${term} ${room.city_or_area}`
+          : term;
+        tasks.push({ profile, category, query });
+        favoriteCounts.set(profile.id, total + 1);
+        categoryCounts.get(profile.id)?.set(category, queryIndex + 1);
+      };
+
+      for (const category of categories) {
+        const alreadyCovered = demoProfiles.some((profile) => (categoryCounts.get(profile.id)?.get(category) ?? 0) > 0);
+        if (alreadyCovered) continue;
+        const profile = [...demoProfiles].sort((a, b) =>
+          (favoriteCounts.get(a.id) ?? 0) - (favoriteCounts.get(b.id) ?? 0))[0]!;
+        addTask(profile, category);
+      }
+      for (const profile of demoProfiles) {
+        while ((favoriteCounts.get(profile.id) ?? 0) < 2) {
+          const category = categories.find((item) => (categoryCounts.get(profile.id)?.get(item) ?? 0) < demoSearchTerms[item].length);
+          if (!category) throw new Error(`Could not add enough demo favorites for ${profile.nickname}`);
+          addTask(profile, category);
+        }
+      }
+
+      for (const task of tasks) {
+        recordPlanActivity(db, roomId, "demo_search_request", `Searching live Qloo for ${task.category} favorites for ${task.profile.nickname}: “${task.query}”.`);
+        const results = await searchQloo(task.query, entityTypes[task.category]);
+        const existingIds = new Set((db.prepare("SELECT qloo_id FROM favorites WHERE member_id = ?").all(task.profile.id) as { qloo_id: string }[]).map((item) => item.qloo_id));
+        const chosen = results.find((result) => !existingIds.has(result.id) &&
+          !seedResults.some((item) => item.memberId === task.profile.id && item.result.id === result.id));
+        if (!chosen) throw new Error(`Qloo did not return a new ${task.category} favorite for ${task.profile.nickname}`);
+        recordPlanActivity(db, roomId, "demo_search_result", `Qloo returned ${results.length} ${task.category} results for ${task.profile.nickname}; selected ${chosen.name} as a live favorite.`);
+        seedResults.push({
+          memberId: task.profile.id,
+          memberName: task.profile.nickname,
+          category: task.category,
+          query: task.query,
+          result: chosen,
+        });
+      }
+
+      const now = timestamp();
+      db.transaction(() => {
+        const insertMember = db.prepare("INSERT INTO members(id, room_id, nickname, token_hash, is_host, ready, joined_at) VALUES (?, ?, ?, ?, 0, 1, ?)");
+        for (const profile of profiles.slice(1)) {
+          if (existingDemos.some((demo) => demo.id === profile.id)) continue;
+          const { hash } = createMemberToken();
+          insertMember.run(profile.id, roomId, profile.nickname, hash, now);
+        }
+        const saveSearch = db.prepare(`INSERT OR REPLACE INTO member_search_results
+          (member_id, qloo_id, name, entity_type, subtitle, image_url, source, searched_at) VALUES (?, ?, ?, ?, ?, ?, 'demo', ?)`);
+        const saveFavorite = db.prepare("INSERT OR IGNORE INTO favorites(member_id, qloo_id, name, entity_type, source) VALUES (?, ?, ?, ?, 'demo')");
+        for (const item of seedResults) {
+          saveSearch.run(item.memberId, item.result.id, item.result.name, item.result.entityType, item.result.description, item.result.imageUrl, now);
+          saveFavorite.run(item.memberId, item.result.id, item.result.name, item.result.entityType);
+          recordPlanActivity(db, roomId, "demo_favorite_search", `Live Qloo ${item.category} search for ${item.memberName} found and added “${item.result.name}” from “${item.query}”.`);
+        }
+        const scriptedMessagesExist = db.prepare(`SELECT 1 FROM chat_messages
+          WHERE member_id IN (?, ?) LIMIT 1`).get(...demoProfiles.map((profile) => profile.id));
+        if (!scriptedMessagesExist) {
+          const saveMessage = db.prepare("INSERT INTO chat_messages(id, room_id, member_id, text, created_at) VALUES (?, ?, ?, ?, ?)");
+          demoConversation.forEach((message, index) => {
+            const profile = profiles.find((item) => item.nickname === message.nickname);
+            if (!profile) throw new Error(`Missing demo profile for ${message.nickname}`);
+            saveMessage.run(randomUUID(), roomId, profile.id, message.text, now - (demoConversation.length - index) * 1000);
+          });
+        }
+        db.prepare("UPDATE members SET ready = 1 WHERE room_id = ?").run(roomId);
+        recordPlanActivity(db, roomId, "demo_profiles_ready", `Added live-Qloo favorites for ${demoNicknames.join(" and ")}; all room members are ready.`);
+      })();
+
+      beginPlanGeneration(db, qloo, request, roomId, previousPlan?.version ?? 0);
+      return reply.code(202).send({ status: "generating" });
+    } catch (error) {
+      request.log.error({ err: error }, "Could not prepare live-Qloo demo profiles");
+      db.prepare("UPDATE rooms SET status = ? WHERE id = ?").run(room.status, roomId);
+      broadcast(roomId);
+      if (error instanceof Error && error.message.includes("HTTP 429")) {
+        reply.header("Retry-After", "60");
+        return apiError(reply, 503, "QLOO_RATE_LIMITED", "Qloo is rate-limiting live searches. Wait briefly before starting the demo again.");
+      }
+      return apiError(reply, 502, "DEMO_QLOO_SEARCH_FAILED", "Could not find enough live Qloo favorites. Check Qloo setup and try again in a fresh room.");
+    } finally {
+      demoSeedingRooms.delete(roomId);
+    }
   });
 
   app.post("/api/rooms/:roomId/plan", async (request, reply) => {
@@ -429,25 +762,7 @@ export function createApp(db: Database.Database, qloo: Client | null, options: {
         return apiError(reply, 429, "PLAN_COOLDOWN", "Please wait briefly before generating another plan.");
       }
     }
-    const isRegeneration = (previousPlan?.version ?? 0) > 0;
-    if (isRegeneration) {
-      db.transaction(() => {
-        const active = db.prepare("SELECT category, qloo_id FROM picks WHERE room_id = ? AND state = 'active'").all(roomId) as { category: string; qloo_id: string }[];
-        const reject = db.prepare("INSERT OR IGNORE INTO rejected_entities(room_id, category, qloo_id, rejected_at) VALUES (?, ?, ?, ?)");
-        active.forEach((pick) => reject.run(roomId, pick.category, pick.qloo_id, timestamp()));
-      })();
-    }
-    db.prepare("INSERT OR REPLACE INTO plans(room_id, version, status, error_code, updated_at) VALUES (?, ?, 'generating', NULL, ?)").run(roomId, previousPlan?.version ?? 0, timestamp());
-    db.prepare("UPDATE rooms SET status = 'generating' WHERE id = ?").run(roomId);
-    broadcast(roomId);
-    void generateRoomPlan(db, qloo, roomId).then(() => {
-      broadcast(roomId);
-    }).catch((error: unknown) => {
-      request.log.error({ err: error }, "Plan generation failed");
-      db.prepare("UPDATE plans SET status = 'failed', error_code = 'GENERATION_FAILED', updated_at = ? WHERE room_id = ?").run(timestamp(), roomId);
-      db.prepare("UPDATE rooms SET status = 'failed' WHERE id = ?").run(roomId);
-      broadcast(roomId);
-    });
+    beginPlanGeneration(db, qloo, request, roomId, previousPlan?.version ?? 0);
     return reply.code(202).send({ status: "generating" });
   });
 
